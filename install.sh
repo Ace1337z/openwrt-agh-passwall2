@@ -453,9 +453,30 @@ patch_agh_dns() {
     BEGIN {
         n = split(keys, k, " ")
         for (i = 1; i <= n; i++) managed[k[i]] = 1
-        found = 0; in_dns = 0; skip = 0
+        found = 0; in_dns = 0; skip = 0; in_http = 0
     }
     {
+        # Web UI: a plain 0.0.0.0 address becomes a dual-stack [::] socket in
+        # AdGuardHome, so pin it to the LAN IPv4 when IPv6 binding is off.
+        # The port is taken from the existing value (default 3000).
+        if ($0 ~ /^http:[[:space:]]*$/) { print; in_http = 1; next }
+        if (in_http == 1) {
+            if ($0 ~ /^[^[:space:]#]/) {
+                in_http = 0
+            } else if ($0 ~ /^  address:/) {
+                a = $0
+                sub(/^  address:[[:space:]]*/, "", a)
+                if (v6 == 0 && v4a != "") {
+                    wp = "3000"
+                    if (match(a, /[0-9]+[[:space:]]*$/)) {
+                        wp = substr(a, RSTART, RLENGTH)
+                        gsub(/[[:space:]]/, "", wp)
+                    }
+                    print "  address: " v4a ":" wp
+                    next
+                }
+            }
+        }
         if (found == 0 && $0 ~ /^dns:[[:space:]]*$/) {
             found = 1; print; emit(); in_dns = 1; skip = 0; next
         }
@@ -762,7 +783,7 @@ step_agh_config() {
         patch_agh_dns "$AGH_YAML" "$new_yaml"
         [ -s "$new_yaml" ] || die "failed to generate patched AdGuardHome config"
         if [ "$DRY" = 1 ]; then
-            log "  [dry] would replace $(basename "$AGH_YAML") (managed dns: keys)"
+            log "  [dry] would replace $(basename "$AGH_YAML") (managed dns: keys, IPv4-only web address)"
             rm -f "$new_yaml"
         else
             # validate before it ever becomes live
@@ -770,12 +791,13 @@ step_agh_config() {
             if ! validate_agh_yaml; then
                 die "AdGuardHome rejected the generated config - nothing else changed"
             fi
+            webaddr="$(sed -n 's/^  address:[[:space:]]*//p' "$AGH_YAML" | head -n 1)"
             if [ "$IPV6" = 1 ]; then
                 binds="0.0.0.0 + ::"
             else
                 binds="${AGH_BIND_V4} + 127.0.0.1"
             fi
-            log "  - patched and validated (bind ${binds})"
+            log "  - patched and validated (dns bind ${binds}, web ${webaddr:-unset})"
         fi
     else
         if [ "$DRY" = 1 ]; then
@@ -790,7 +812,8 @@ step_agh_config() {
             if ! validate_agh_yaml; then
                 die "AdGuardHome rejected the generated default config"
             fi
-            log "  - wrote fresh config and validated it"
+            webaddr="$(sed -n 's/^  address:[[:space:]]*//p' "$AGH_YAML" | head -n 1)"
+            log "  - wrote fresh config and validated it (web ${webaddr:-unset})"
         fi
     fi
 

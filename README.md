@@ -21,9 +21,11 @@ LAN client ──▶ router:53              AdGuardHome (filter, cache, query lo
 ```
 
 dnsmasq hand-off note: OpenWrt keeps advertising the router address as the DNS
-server, so clients always talk to `:53`. AdGuardHome binds `:53` (IPv4, plus
-`::` when IPv6 is present) and forwards everything except local names to
-PassWall2.
+server, so clients always talk to `:53`. AdGuardHome binds `:53` (LAN IPv4 +
+`127.0.0.1`, or `0.0.0.0` + `::` when IPv6 is enabled) and forwards everything
+except local names to PassWall2. With `IPV6_ENABLE=0` the web UI is pinned to
+`<lan-ip>:3000` for the same reason: AdGuardHome turns a plain `0.0.0.0` into a
+dual-stack `[::]` socket.
 
 ---
 
@@ -211,7 +213,8 @@ Packages are **not** removed: `opkg remove adguardhome luci-app-adguardhome`.
 
 ## Known limitations
 
-* **IPv6:** AdGuardHome binds `::` when the IPv6 stack is present, otherwise
+* **IPv6:** AdGuardHome binds `::` (DNS and web UI) when the IPv6 stack is
+  present, otherwise
   IPv6 clients (which get the router's link-local via RA) would have no
   resolver. If you disable IPv6 later, re-run the installer so the config
   matches, or AdGuardHome fails to bind.
@@ -222,8 +225,11 @@ Packages are **not** removed: `opkg remove adguardhome luci-app-adguardhome`.
   default keeps them ephemeral on purpose.
 * **Third-party feed required** for PassWall2; package names/feeds change
   between releases, so feed errors are surfaced instead of swallowed.
-* **Admin UI**: AdGuardHome serves `0.0.0.0:3000`; the LAN-only firewall rule is
-  the protection. Complete the setup wizard right away.
+* **Admin UI**: with IPv6 disabled AdGuardHome serves the UI on the LAN IPv4 only
+  (e.g. `192.168.1.1:3000`), not on `127.0.0.1`, so a local `curl` from the
+  router must use the LAN address. The first-run admin user is created through
+  AdGuardHome's own install API; the generated password is written to
+  `/etc/agh-pw-backup/agh-admin.txt` (0600).
 * The watchdog only restarts services. It deliberately never rewrites
   config/ports, so a wrong config cannot be "fixed" into a worse one.
 
