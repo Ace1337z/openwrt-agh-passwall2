@@ -55,6 +55,12 @@ AGH_FALLBACK="${AGH_FALLBACK:-}"
 AGH_CACHE="${AGH_CACHE:-16777216}"     # 16 MiB DNS cache (65536 entries)
 IPV6_ENABLE="${IPV6_ENABLE:-auto}"     # auto|1|0 - bind AdGuardHome on ::
 AGH_RATELIMIT="${AGH_RATELIMIT:-0}"    # per-client qps limit, 0 = unlimited
+# First-run web admin. A password shorter than 8 characters is rejected by
+# AdGuardHome, so an empty AGH_PASS means "generate a 16 character one" and
+# write it to AGH_ADMIN_FILE.
+AGH_USER="${AGH_USER:-admin}"
+AGH_PASS="${AGH_PASS:-}"
+AGH_ADMIN_FILE="${AGH_ADMIN_FILE:-}"
 WD_BIN="${WD_BIN:-/usr/sbin/agh-pw-watchdog}"
 CRON_FILE="${CRON_FILE:-/etc/crontabs/root}"
 
@@ -101,6 +107,7 @@ Environment overrides:
   AGH_PORT=53 DNSMASQ_PORT=54 PW_DNS_PORT=15353
   BOOT1=223.5.5.5 BOOT2=119.29.29.29 AGH_FALLBACK=
   AGH_CACHE=16777216 AGH_RATELIMIT=0 IPV6_ENABLE=auto|1|0
+  AGH_USER=admin AGH_PASS= (empty: generate) AGH_ADMIN_FILE=
   WD_BIN CRON_FILE
   AGH_DIR AGH_YAML AGH_UCI DHCP_CFG PW_CFG FW_CFG INIT_D AGH_WORKDIR
   AGH_BIN STATE_DIR OVERLAY
@@ -169,6 +176,154 @@ detect_ipv6() {
         0) IPV6=0; return 0 ;;
     esac
     if [ -s /proc/net/if_inet6 ]; then IPV6=1; else IPV6=0; fi
+}
+# LAN IPv4 address AdGuardHome should listen on when IPv6 binding is off.
+lan_ipv4() {
+    l="$(cget network.lan.ipaddr)"
+    case "$l" in
+        "" | 0.0.0.0 | ::)
+            l="$(ubus -S call network.interface.lan status 2>/dev/null |
+                jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+            ;;
+    esac
+    [ -n "${l:-}" ] || l="192.168.1.1"
+    printf '%s' "$l"
+}
+gen_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16
+}
+# POST to AdGuardHome's first-run installer API.
+agh_api_configure() {
+    agh_url="http://127.0.0.1:$1/control/install/configure"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -m "${3:-20}" -H 'Content-Type: application/json' \
+            --data "$2" "$agh_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - -T "${3:-20}" --header 'Content-Type: application/json' \
+            --post-data "$2" "$agh_url"
+    else
+        return 127
+    fi
+}
+# Create the AdGuardHome web admin through its own install API.
+#
+# /control/install/configure only exists while AdGuardHome is in first-run
+# mode, which it decides from the *absence* of the config file it was started
+# with, and it probes the DNS address it is given. The daemon is therefore
+# stopped, started once against a scratch config path (fresh, web on loopback)
+# and configured through the API; then it is stopped again and the resulting
+# `users:` block is transplanted into the real config. Only the admin user is
+# taken from the scratch run; every other key keeps coming from
+# patch_agh_dns().
+ensure_agh_admin() {
+    [ -f "$AGH_YAML" ] || return 0
+    if ! grep -q '^users: \[\]' "$AGH_YAML" 2>/dev/null; then
+        log "  - admin user already configured - left alone"
+        return 0
+    fi
+    [ -n "${AGH_ADMIN_FILE:-}" ] || AGH_ADMIN_FILE="$STATE_DIR/agh-admin.txt"
+    if [ "$DRY" = 1 ]; then
+        log "  [dry] would create the first-run admin user '${AGH_USER}' via /control/install/configure"
+        return 0
+    fi
+    [ -x "$AGH_BIN" ] || { warn "$AGH_BIN missing - cannot set the admin user"; return 0; }
+
+    user="$AGH_USER"
+    pass="$AGH_PASS"
+    if [ -z "$pass" ]; then
+        pass="$(gen_password)"
+        [ -n "$pass" ] || { warn "cannot generate a password - set AGH_PASS"; return 0; }
+    fi
+    if [ "${#pass}" -lt 8 ]; then
+        warn "AGH_PASS is shorter than the 8 characters AdGuardHome requires - admin not created"
+        return 0
+    fi
+
+    lanip="${AGH_BIND_V4:-$(lan_ipv4)}"
+    # Free the web port and, more importantly, :53 so the API probe succeeds.
+    if agh_running; then
+        "${INIT_D}/adguardhome" stop >/dev/null 2>&1 ||
+            kill "$(pidof AdGuardHome)" 2>/dev/null
+        i=0
+        while [ "$i" -lt 10 ] && agh_running; do i=$((i + 1)); sleep 1; done
+        agh_running && kill -9 "$(pidof AdGuardHome)" 2>/dev/null
+    fi
+
+    # The install API only exists in first-run mode, which AdGuardHome decides
+    # from the *absence* of the config file it was started with. A scratch path
+    # is therefore used; the real config is never handed to this instance.
+    tmp_cfg="${AGH_YAML}.agh-pw.setup"
+    rm -f "$tmp_cfg"
+    web_port="${AGH_SETUP_WEB_PORT:-3000}"
+    while port_busy "$web_port"; do
+        web_port=$((web_port + 1))
+        [ "$web_port" -le 3010 ] || break
+    done
+
+    "$AGH_BIN" --config "$tmp_cfg" --work-dir "$AGH_WORKDIR" \
+        --web-addr "127.0.0.1:${web_port}" --logfile syslog --no-check-update \
+        >/dev/null 2>&1 &
+    api_pid=$!
+    i=0
+    while [ "$i" -lt 15 ]; do
+        port_busy "$web_port" && break
+        i=$((i + 1)); sleep 1
+    done
+    if ! port_busy "$web_port"; then
+        warn "AdGuardHome first-run web UI did not come up on :$web_port - admin not created"
+        kill "$api_pid" 2>/dev/null
+        rm -f "$tmp_cfg"
+        return 0
+    fi
+
+    body="{\"web\":{\"ip\":\"127.0.0.1\",\"port\":${web_port}},\"dns\":{\"ip\":\"${lanip}\",\"port\":${AGH_PORT}},\"username\":\"${user}\",\"password\":\"${pass}\"}"
+    api_out="$(agh_api_configure "$web_port" "$body")"
+    api_rc=$?
+    if [ "$api_rc" != 0 ]; then
+        warn "first-run API rejected the admin user (curl rc=$api_rc): ${api_out:-no response}"
+        kill "$api_pid" 2>/dev/null
+        rm -f "$tmp_cfg"
+        return 0
+    fi
+
+    kill "$api_pid" 2>/dev/null
+    i=0
+    while [ "$i" -lt 10 ] && agh_running; do i=$((i + 1)); sleep 1; done
+    agh_running && kill -9 "$(pidof AdGuardHome)" 2>/dev/null
+
+    if grep -q '^users: \[\]' "$tmp_cfg" 2>/dev/null; then
+        warn "the API answered but $tmp_cfg still has no user - admin not created"
+        rm -f "$tmp_cfg"
+        return 0
+    fi
+    awk '
+        NR == FNR {
+            if ($0 ~ /^users:/) { inblk = 1; blk = $0 ORS; next }
+            if (inblk) {
+                if ($0 ~ /^[[:space:]]/ || $0 ~ /^- /) { blk = blk $0 ORS; next }
+                inblk = 0
+            }
+            next
+        }
+        /^users: \[\]$/ { printf "%s", blk; next }
+        { print }
+    ' "$tmp_cfg" "$AGH_YAML" > "${AGH_YAML}.agh-pw.new" &&
+        [ -s "${AGH_YAML}.agh-pw.new" ] &&
+        mv -f "${AGH_YAML}.agh-pw.new" "$AGH_YAML"
+    rm -f "$tmp_cfg"
+
+    if grep -q "^  - name: ${user}$" "$AGH_YAML" 2>/dev/null; then
+        mkdir -p "$STATE_DIR" 2>/dev/null
+        (umask 077; printf 'user=%s\npass=%s\n' "$user" "$pass" > "$AGH_ADMIN_FILE") 2>/dev/null ||
+            warn "cannot write $AGH_ADMIN_FILE"
+        chmod 600 "$AGH_ADMIN_FILE" 2>/dev/null || true
+        log "  - admin user '${user}' created (password: ${pass})"
+        log "  - credentials saved to ${AGH_ADMIN_FILE}"
+    else
+        rm -f "${AGH_YAML}.agh-pw.new"
+        warn "could not transplant the admin user into $AGH_YAML - web UI left unconfigured"
+    fi
+    return 0
 }
 
 initctl() {
@@ -253,11 +408,21 @@ patch_agh_dns() {
     awk -v port="$AGH_PORT" -v pwdns="127.0.0.1:${PW_DNS_PORT}" \
         -v dm="$DNSMASQ_PORT" -v b1="$BOOT1" -v b2="$BOOT2" \
         -v fb="$AGH_FALLBACK" -v cache="$AGH_CACHE" -v rl="$AGH_RATELIMIT" -v v6="$IPV6" \
+        -v v4a="$AGH_BIND_V4" \
         -v keys="bind_hosts port upstream_dns upstream_dns_file bootstrap_dns fallback_dns upstream_mode fastest_timeout cache_size ratelimit use_private_ptr_resolvers private_networks local_ptr_upstreams" '
     function emit(   ) {
         print "  bind_hosts:"
-        print "  - 0.0.0.0"
-        if (v6 == 1) print "  - ::"
+        if (v6 == 1) {
+            print "  - 0.0.0.0"
+            print "  - ::"
+        } else if (v4a != "") {
+            # AdGuardHome expands 0.0.0.0 to a dual-stack [::] socket on Linux,
+            # so an explicit IPv4 list is the only way to stay IPv4-only.
+            print "  - " v4a
+            print "  - 127.0.0.1"
+        } else {
+            print "  - 0.0.0.0"
+        }
         print "  port: " port
         print "  upstream_dns:"
         print "  - " pwdns
@@ -569,7 +734,8 @@ step_preflight() {
 step_packages() {
     log "Step 1/7: packages"
     pkg_installed adguardhome || pkg_install adguardhome || die "AdGuardHome install failed - see errors above"
-    [ -x "$AGH_BIN" ] || die "$AGH_BIN missing after install - wrong package?"
+    # In dry mode the install above only logs, so the binary cannot exist yet.
+    [ "$DRY" = 1 ] || [ -x "$AGH_BIN" ] || die "$AGH_BIN missing after install - wrong package?"
     pkg_install luci-app-adguardhome || warn "luci-app-adguardhome not installed - CLI on :3000 still works"
 
     if ! pkg_installed passwall2 && ! pkg_installed luci-app-passwall2; then
@@ -587,6 +753,7 @@ step_packages() {
 
 step_agh_config() {
     log "Step 2/7: AdGuardHome config (:${AGH_PORT}, upstream PassWall2 :${PW_DNS_PORT})"
+    [ -n "${AGH_BIND_V4:-}" ] || AGH_BIND_V4="$(lan_ipv4)"
     [ "$DRY" = 1 ] || mkdir -p "$AGH_DIR" "$AGH_WORKDIR"
     backup "$AGH_YAML"
 
@@ -603,7 +770,11 @@ step_agh_config() {
             if ! validate_agh_yaml; then
                 die "AdGuardHome rejected the generated config - nothing else changed"
             fi
-            if [ "$IPV6" = 1 ]; then binds="0.0.0.0 + ::"; else binds="0.0.0.0"; fi
+            if [ "$IPV6" = 1 ]; then
+                binds="0.0.0.0 + ::"
+            else
+                binds="${AGH_BIND_V4} + 127.0.0.1"
+            fi
             log "  - patched and validated (bind ${binds})"
         fi
     else
@@ -623,6 +794,7 @@ step_agh_config() {
         fi
     fi
 
+    ensure_agh_admin
     if [ "$DRY" = 0 ]; then
         chmod 600 "$AGH_YAML" 2>/dev/null || true
         tmp_owner="$(cget adguardhome.config.user)"
@@ -726,11 +898,11 @@ step_firewall() {
 
 step_restart() {
     log "Step 6/7: restart dnsmasq -> passwall2 -> adguardhome"
-    initctl dnsmasq restart || die "dnsmasq restart failed"
+    initctl dnsmasq restart || { [ "$DRY" = 1 ] || die "dnsmasq restart failed"; }
     initctl passwall2 enable || true
     initctl passwall2 restart || warn "passwall2 restart failed"
     initctl adguardhome enable || true
-    initctl adguardhome restart || die "adguardhome restart failed"
+    initctl adguardhome restart || { [ "$DRY" = 1 ] || die "adguardhome restart failed"; }
 
     if [ "$DRY" = 1 ]; then
         log "  [dry] skip service verification"
@@ -862,8 +1034,15 @@ step_summary() {
     rip="${rip%%/*}"
     [ -n "${rip:-}" ] || rip="<router-ip>"
     log "Next steps:"
-    log "  1) Open AdGuardHome UI: http://${rip}:3000 - create the admin login now"
-    log "     (until you do, anyone on the LAN can set it)"
+    if grep -q '^users: \[\]' "$AGH_YAML" 2>/dev/null; then
+        log "  1) Open AdGuardHome UI: http://${rip}:3000 - create the admin login now"
+        log "     (until you do, anyone on the LAN can set it)"
+    else
+        log "  1) Open AdGuardHome UI: http://${rip}:3000"
+        if [ -n "${AGH_ADMIN_FILE:-}" ] && [ -f "$AGH_ADMIN_FILE" ]; then
+            log "     first-run admin credentials: $AGH_ADMIN_FILE"
+        fi
+    fi
     log "  2) Add/choose nodes in LuCI -> Services -> PassWall2"
     log "  3) Verify:  nslookup openwrt.org 127.0.0.1"
     if [ "$WATCHDOG" = 1 ] && [ -x "$WD_BIN" ]; then
