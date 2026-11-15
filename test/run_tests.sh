@@ -98,6 +98,12 @@ case "$1" in
 esac
 exit 1
 EOS
+    cat > "$T/bin/id" <<'EOS'
+#!/bin/sh
+# only "-u <user>" is used by install.sh (AdGuardHome uid for the nft exception)
+if [ "$1" = "-u" ] && [ -n "${2:-}" ]; then echo 853; exit 0; fi
+exec /usr/bin/id "$@"
+EOS
     cat > "$T/bin/nslookup" <<'EOS'
 #!/bin/sh
 [ "${NS_OK:-0}" = 1 ] && exit 0
@@ -139,7 +145,8 @@ assert len(bh) == len(set(bh)), "duplicate bind_hosts entries"
 up = dns.get("upstream_dns"); assert isinstance(up, list) and up, "upstream_dns empty"
 assert len(up) == len(set(up)), "duplicate upstream_dns entries"
 assert dns.get("port") == 53, "dns.port != 53"
-assert any("127.0.0.1:15353" in u for u in up), "no PassWall2 upstream"
+assert any(u.startswith("https://") for u in up), "no DoH upstream"
+assert any("127.0.0.1:5335" in u for u in up), "no dnsmasq local upstream"
 PY
 EOS
     for n in dnsmasq passwall2 adguardhome; do :; done
@@ -171,6 +178,14 @@ EOS
     cat > "$T/init.d/passwall2" <<'EOS'
 #!/bin/sh
 echo "passwall2 $1" >> "$SERVICE_LOG"
+EOS
+    cat > "$T/init.d/firewall" <<'EOS'
+#!/bin/sh
+echo "firewall $1" >> "$SERVICE_LOG"
+EOS
+    cat > "$T/init.d/cron" <<'EOS'
+#!/bin/sh
+echo "cron $1" >> "$SERVICE_LOG"
 EOS
     chmod +x "$T/bin/"* "$T/init.d/"*
 }
@@ -209,6 +224,9 @@ envrun() {
     PW_CFG="$T/root/etc/config/passwall2" FW_CFG="$T/root/etc/config/firewall" \
     INIT_D="$T/init.d" AGH_WORKDIR="$T/root/var/lib/adguardhome" \
     STATE_DIR="$T/root/etc/agh-pw-backup" OVERLAY="$T/root" \
+    FW4_NFT_DIR="$T/root/etc/nftables.d" \
+    HIJACK_NFT="$T/root/etc/nftables.d/20-agh-dns-hijack.nft" \
+    LAN_IF="br-lan" AGH_UID="853" \
     WD_BIN="$T/root/usr/sbin/agh-pw-watchdog" CRON_FILE="$T/root/etc/crontabs/root" \
     AGH_PW_INITD="$T/init.d" \
     AGH_PW_SKIP_ROOT=1 AGH_PW_WAIT=2 PKG_FAIL="$T/run/pkg.fail" PATH="$T/bin:$PATH" \
@@ -253,15 +271,28 @@ setup
 envrun > "$T/run/t1.log" 2>&1; rc=$?
 check "rc=0" "[ $rc -eq 0 ]"
 check "yaml created" "[ -s $T/root/etc/adguardhome/adguardhome.yaml ]"
-check "dnsmasq port 54" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].port)" = 54 ]'
+check "dnsmasq port 5335" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].port)" = 5335 ]'
 check "passwall dns_redirect=0" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get passwall2.@global[0].dns_redirect)" = 0 ]'
-check "firewall rule added" 'UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Allow-AdGuardHome-LAN"'
+check "dnsmasq bypass rule added" 'UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Block-LAN-DNS-Bypass-5335"'
+check "no Allow-AdGuardHome-LAN rule" '! UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Allow-AdGuardHome-LAN"'
 check "manifest written" "[ -s $T/root/etc/agh-pw-backup/manifest.txt ]"
 check "dnsmasq restarted before adguardhome" 'awk "/dnsmasq restart/{d=NR} /adguardhome restart/{a=NR} END{exit !(d<a)}" "$T/run/services.log"'
-check "no ipv6 fallback leak" '! grep -q "2606:4700" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "no ipv6 bootstrap" '! grep -q "2001:4860" "$T/root/etc/adguardhome/adguardhome.yaml"'
 check "no fallback_dns by default" '! grep -q "fallback_dns" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "quad9 doh upstream" 'grep -q "https://dns10.quad9.net/dns-query" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "cloudflare doh fallback upstream" 'grep -q "https://cloudflare-dns.com/dns-query" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "no passwall dns upstream" '! grep -q "15353" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "lan local upstream to 5335" 'grep -q "\[/lan/\]127.0.0.1:5335" "$T/root/etc/adguardhome/adguardhome.yaml"'
 check "private ptr on" 'grep -q "use_private_ptr_resolvers: true" "$T/root/etc/adguardhome/adguardhome.yaml"'
-check "cache 16MiB" 'grep -q "cache_size: 16777216" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "cache 4MiB" 'grep -q "cache_size: 4194304" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "aaaa disabled" 'grep -q "aaaa_disabled: true" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "dnssec on" 'grep -q "enable_dnssec: true" "$T/root/etc/adguardhome/adguardhome.yaml"'
+check "nft hijack file written" "[ -s $T/root/etc/nftables.d/20-agh-dns-hijack.nft ]"
+check "nft prerouting priority -150" 'grep -q "priority -150" $T/root/etc/nftables.d/20-agh-dns-hijack.nft'
+check "nft prerouting redirect to :53" 'grep -q "th dport 53 counter redirect to :53" $T/root/etc/nftables.d/20-agh-dns-hijack.nft'
+check "nft excludes agh uid" 'grep -q "meta skuid 853 counter return" $T/root/etc/nftables.d/20-agh-dns-hijack.nft'
+check "nft matches br-lan" 'grep -q "iifname \"br-lan\"" $T/root/etc/nftables.d/20-agh-dns-hijack.nft'
+check "firewall reloaded" 'grep -q "firewall reload" "$T/run/services.log"'
 
 echo "== T2 re-run idempotent"
 cp "$T/root/etc/adguardhome/adguardhome.yaml" "$T/run/yaml.after1"
@@ -270,7 +301,8 @@ check "rc=0" "[ $rc -eq 0 ]"
 check "yaml unchanged" "cmp -s $T/run/yaml.after1 $T/root/etc/adguardhome/adguardhome.yaml"
 check "single bind_hosts key" '[ "$(grep -c "^  bind_hosts:" $T/root/etc/adguardhome/adguardhome.yaml)" = 1 ]'
 check "single port key in dns" '[ "$(grep -c "^  port: 53$" $T/root/etc/adguardhome/adguardhome.yaml)" = 1 ]'
-check "single firewall rule" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -c "Allow-AdGuardHome-LAN")" = 1 ]'
+check "single firewall rule" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -c "Block-LAN-DNS-Bypass-5335")" = 1 ]'
+check "single nft chain file" '[ "$(find $T/root/etc/nftables.d -name "20-agh-dns-hijack.nft" | wc -l)" = 1 ]'
 check "no dnsmasq server list" '! UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].server >/dev/null 2>&1'
 
 echo "== T3 legacy yaml patch"
@@ -322,7 +354,8 @@ check "rc=0" "[ $rc -eq 0 ]"
 check "yaml restored" "cmp -s $T/run/yaml.orig $T/root/etc/adguardhome/adguardhome.yaml"
 check "dnsmasq restored to 53" "cmp -s $T/run/dhcp.orig $T/root/etc/config/dhcp"
 check "passwall restored" "cmp -s $T/run/pw.orig $T/root/etc/config/passwall2"
-check "firewall rule removed" '! UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Allow-AdGuardHome-LAN"'
+check "firewall rule removed" '! UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Block-LAN-DNS-Bypass"'
+check "nft hijack file removed" "[ ! -f $T/root/etc/nftables.d/20-agh-dns-hijack.nft ]"
 check "agh stopped" "[ ! -f $T/run/agh.up ]"
 check "uninstall without --yes refuses" 'envrun --uninstall >/dev/null 2>&1 </dev/null; [ $? -eq 1 ]'
 
@@ -349,13 +382,24 @@ check "non-zero exit" "[ $rc -ne 0 ]"
 check "refused with message" 'grep -q "free port 53 first" "$T/run/t8.log"'
 check "nothing changed" "cmp -s $T/run/dhcp.pre $T/root/etc/config/dhcp"
 
-echo "== T9 --dnsmasq-forward persistent + no dup"
+echo "== T9 --no-dns-hijack skips the redirect chain"
 setup
-envrun --dnsmasq-forward >/dev/null 2>&1
-envrun --dnsmasq-forward >/dev/null 2>&1
-check "one server entry" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].server)" = "127.0.0.1#15353" ]'
-check "allservers set" '[ "$(UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].allservers)" = 1 ]'
-check "no /tmp drop-in written" '[ ! -f /tmp/dnsmasq.d/dnsmasq-passwall2.conf ] || ! grep -q "Managed by agh-pw" /tmp/dnsmasq.d/dnsmasq-passwall2.conf'
+envrun --no-dns-hijack > "$T/run/t9.log" 2>&1; rc=$?
+check "rc=0" "[ $rc -eq 0 ]"
+check "no nft file" "[ ! -f $T/root/etc/nftables.d/20-agh-dns-hijack.nft ]"
+check "skipped message" 'grep -q "nftables DNS redirect skipped" "$T/run/t9.log"'
+check "no firewall reload" '! grep -q "firewall reload" "$T/run/services.log"'
+check "dnsmasq bypass block still added" 'UCI_DB=$T/root/etc/config python3 $T/bin/uci -q show firewall | grep -q "Block-LAN-DNS-Bypass-5335"'
+check "no dnsmasq server list" '! UCI_DB=$T/root/etc/config python3 $T/bin/uci -q get dhcp.@dnsmasq[0].server >/dev/null 2>&1'
+
+echo "== T9b unmanaged nft file is not overwritten"
+setup
+mkdir -p "$T/root/etc/nftables.d"
+printf 'chain someone_else { }\n' > "$T/root/etc/nftables.d/20-agh-dns-hijack.nft"
+envrun > "$T/run/t9b.log" 2>&1; rc=$?
+check "non-zero exit" "[ $rc -ne 0 ]"
+check "refused with message" 'grep -q "refusing to overwrite" "$T/run/t9b.log"'
+check "file untouched" 'grep -q "someone_else" $T/root/etc/nftables.d/20-agh-dns-hijack.nft'
 
 echo "== T10 missing PassWall2 feed"
 setup

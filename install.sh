@@ -6,10 +6,12 @@
 #  SETTINGS ONLY. No proxy nodes are added. Add/choose them in LuCI afterwards.
 #
 #  Resulting chain:
-#    LAN client -> router:53                      AdGuardHome (filter, cache)
-#               -> tcp://127.0.0.1:15353          PassWall2 DNS (CN/proxy split)
-#               -> .lan/.local/.home.arpa
-#                  -> 127.0.0.1:54                dnsmasq (DHCP + local names)
+#    LAN + router DNS -> router:53               AdGuardHome (filter, cache)
+#                      -> Quad9 / Cloudflare DoH external DNS
+#                      -> .lan / .local
+#                         -> 127.0.0.1:5335      dnsmasq (DHCP + local names)
+#    nftables redirects LAN/router plaintext DNS before PassWall2 NAT.
+#    AdGuardHome UID bypasses output redirect for bootstrap DNS.
 #
 #  Safety model:
 #    * every file touched is backed up next to itself (*.agh-pw.bak.<ts>) and
@@ -33,8 +35,7 @@ umask 077
 
 # ------------------------------ tunables --------------------------------------
 AGH_PORT="${AGH_PORT:-53}"             # AdGuardHome DNS listen port (LAN DNS)
-DNSMASQ_PORT="${DNSMASQ_PORT:-54}"     # dnsmasq port (must differ from AGH_PORT)
-PW_DNS_PORT="${PW_DNS_PORT:-15353}"    # PassWall2 local DNS port
+DNSMASQ_PORT="${DNSMASQ_PORT:-5335}"   # dnsmasq port (must differ from AGH_PORT)
 AGH_DIR="${AGH_DIR:-/etc/adguardhome}"
 AGH_YAML="${AGH_YAML:-${AGH_DIR}/adguardhome.yaml}"
 AGH_UCI="${AGH_UCI:-/etc/config/adguardhome}"
@@ -46,15 +47,29 @@ AGH_WORKDIR="${AGH_WORKDIR:-/var/lib/adguardhome}"
 AGH_BIN="${AGH_BIN:-/usr/bin/AdGuardHome}"
 STATE_DIR="${STATE_DIR:-/etc/agh-pw-backup}"
 OVERLAY="${OVERLAY:-/overlay}"
-BOOT1="${BOOT1:-223.5.5.5}"            # bootstrap resolvers (plain IPv4, v4-only)
-BOOT2="${BOOT2:-119.29.29.29}"
-# Fallback resolvers are opt-in: with them set, AGH answers directly from
-# plaintext DNS when PassWall2 DNS fails, which leaks queries outside the
-# tunnel. Empty by default (PassWall2 DNS is authoritative).
+# External upstream: encrypted DNS (DoH) so queries cannot be read or spoofed
+# on the ISP path. Both are resolved through bootstrap_dns below, which the
+# firewall redirects before PassWall2's NAT chain.
+AGH_UPSTREAM1="${AGH_UPSTREAM1:-https://dns10.quad9.net/dns-query}"
+AGH_UPSTREAM2="${AGH_UPSTREAM2:-https://cloudflare-dns.com/dns-query}"
+BOOT1="${BOOT1:-9.9.9.10}"             # Quad9 plain IPv4, for DoH bootstrap only
+BOOT2="${BOOT2:-149.112.112.10}"
+BOOT3="${BOOT3:-1.1.1.1}"
+# Fallback resolvers are opt-in: with them set, AGH answers from plaintext DNS
+# when both DoH upstreams fail, which leaks queries outside the encrypted path.
 AGH_FALLBACK="${AGH_FALLBACK:-}"
-AGH_CACHE="${AGH_CACHE:-16777216}"     # 16 MiB DNS cache (65536 entries)
+AGH_CACHE="${AGH_CACHE:-4194304}"      # 4 MiB DNS cache
+AGH_DISABLE_AAAA="${AGH_DISABLE_AAAA:-true}"
+AGH_DNSSEC="${AGH_DNSSEC:-true}"
 IPV6_ENABLE="${IPV6_ENABLE:-auto}"     # auto|1|0 - bind AdGuardHome on ::
 AGH_RATELIMIT="${AGH_RATELIMIT:-0}"    # per-client qps limit, 0 = unlimited
+# Force LAN and router plaintext DNS to AdGuardHome with an nftables chain that
+# is hooked before PassWall2's NAT. Disable with DNS_HIJACK=0.
+DNS_HIJACK="${DNS_HIJACK:-1}"
+FW4_NFT_DIR="${FW4_NFT_DIR:-/etc/nftables.d}"
+HIJACK_NFT="${HIJACK_NFT:-${FW4_NFT_DIR}/20-agh-dns-hijack.nft}"
+AGH_UID="${AGH_UID:-}"                 # AdGuardHome UID, autodetected when empty
+LAN_IF="${LAN_IF:-}"                   # LAN bridge, autodetected when empty
 # First-run web admin. A password shorter than 8 characters is rejected by
 # AdGuardHome, so an empty AGH_PASS means "generate a 16 character one" and
 # write it to AGH_ADMIN_FILE.
@@ -67,13 +82,14 @@ CRON_FILE="${CRON_FILE:-/etc/crontabs/root}"
 DRY=0
 UNINSTALL=0
 ASSUME=0
-DNSMASQ_FORWARD=0
 WATCHDOG=1
 
 TS="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${TMPDIR:-/tmp}/agh-pw.$$"
 ROLLBACK_ARMED=0
 FW_ADDED=""
+HIJACK_ADDED=""
+HIJACK_EXISTED=0
 AGH_PREV_RUNNING=0
 IPV6=0
 
@@ -97,16 +113,18 @@ Usage: install.sh [options]
 Options:
   --dry-run             show what would change, change nothing
   --uninstall           stop AdGuardHome and restore the previous DNS setup
-  --dnsmasq-forward     also make dnsmasq forward to PassWall2 DNS (UCI,
-                        persistent; off by default - AdGuardHome already does)
+  --no-dns-hijack       do not install the nftables DNS redirect chain
   --no-watchdog         do not install the 2-minute AdGuardHome health cron
   -y, --yes             do not ask for confirmation (uninstall)
   -h, --help            this help
 
 Environment overrides:
-  AGH_PORT=53 DNSMASQ_PORT=54 PW_DNS_PORT=15353
-  BOOT1=223.5.5.5 BOOT2=119.29.29.29 AGH_FALLBACK=
-  AGH_CACHE=16777216 AGH_RATELIMIT=0 IPV6_ENABLE=auto|1|0
+  AGH_PORT=53 DNSMASQ_PORT=5335
+  AGH_UPSTREAM1=https://dns10.quad9.net/dns-query
+  AGH_UPSTREAM2=https://cloudflare-dns.com/dns-query
+  BOOT1=9.9.9.10 BOOT2=149.112.112.10 BOOT3=1.1.1.1 AGH_FALLBACK=
+  AGH_CACHE=4194304 AGH_RATELIMIT=0 IPV6_ENABLE=auto|1|0
+  DNS_HIJACK=1 AGH_UID= LAN_IF= HIJACK_NFT FW4_NFT_DIR
   AGH_USER=admin AGH_PASS= (empty: generate) AGH_ADMIN_FILE=
   WD_BIN CRON_FILE
   AGH_DIR AGH_YAML AGH_UCI DHCP_CFG PW_CFG FW_CFG INIT_D AGH_WORKDIR
@@ -267,6 +285,7 @@ ensure_agh_admin() {
     i=0
     while [ "$i" -lt 15 ]; do
         port_busy "$web_port" && break
+        kill -0 "$api_pid" 2>/dev/null || break
         i=$((i + 1)); sleep 1
     done
     if ! port_busy "$web_port"; then
@@ -349,6 +368,7 @@ backup() {
     newest="$(backups_of "$bf" | head -n 1)"
     if [ -n "$newest" ] && cmp -s "$bf" "$newest"; then
         log "  - $bf unchanged since last run"
+        [ "$DRY" = 1 ] || printf '%s\t%s\n' "$bf" "$newest" >> "$RUN_DIR/files"
         return 0
     fi
     bak="$bf.agh-pw.bak.$TS"
@@ -405,11 +425,12 @@ pkg_install() {
 patch_agh_dns() {
     in_file="$1"
     out_file="$2"
-    awk -v port="$AGH_PORT" -v pwdns="127.0.0.1:${PW_DNS_PORT}" \
-        -v dm="$DNSMASQ_PORT" -v b1="$BOOT1" -v b2="$BOOT2" \
+    awk -v port="$AGH_PORT" -v up1="$AGH_UPSTREAM1" -v up2="$AGH_UPSTREAM2" \
+        -v dm="$DNSMASQ_PORT" -v b1="$BOOT1" -v b2="$BOOT2" -v b3="$BOOT3" \
         -v fb="$AGH_FALLBACK" -v cache="$AGH_CACHE" -v rl="$AGH_RATELIMIT" -v v6="$IPV6" \
+        -v aaaa="$AGH_DISABLE_AAAA" -v dnssec="$AGH_DNSSEC" \
         -v v4a="$AGH_BIND_V4" \
-        -v keys="bind_hosts port upstream_dns upstream_dns_file bootstrap_dns fallback_dns upstream_mode fastest_timeout cache_size ratelimit use_private_ptr_resolvers private_networks local_ptr_upstreams" '
+        -v keys="bind_hosts port upstream_dns upstream_dns_file bootstrap_dns fallback_dns upstream_mode fastest_timeout cache_size cache_optimistic ratelimit aaaa_disabled enable_dnssec use_private_ptr_resolvers private_networks local_ptr_upstreams" '
     function emit(   ) {
         print "  bind_hosts:"
         if (v6 == 1) {
@@ -425,14 +446,15 @@ patch_agh_dns() {
         }
         print "  port: " port
         print "  upstream_dns:"
-        print "  - " pwdns
+        print "  - " up1
+        print "  - " up2
         print "  - \"[/lan/]127.0.0.1:" dm "\""
         print "  - \"[/local/]127.0.0.1:" dm "\""
-        print "  - \"[/home.arpa/]127.0.0.1:" dm "\""
         print "  upstream_dns_file: \"\""
         print "  bootstrap_dns:"
         print "  - " b1
         print "  - " b2
+        print "  - " b3
         if (fb != "") {
             print "  fallback_dns:"
             print "  - " fb
@@ -440,13 +462,12 @@ patch_agh_dns() {
         print "  upstream_mode: parallel"
         print "  fastest_timeout: 1s"
         print "  cache_size: " cache
+        print "  cache_optimistic: false"
         print "  ratelimit: " rl
+        print "  aaaa_disabled: " aaaa
+        print "  enable_dnssec: " dnssec
         print "  use_private_ptr_resolvers: true"
-        print "  private_networks:"
-        print "  - 192.168.0.0/16"
-        print "  - 10.0.0.0/8"
-        print "  - 172.16.0.0/12"
-        print "  - fd00::/8"
+        print "  private_networks: []"
         print "  local_ptr_upstreams:"
         print "  - 127.0.0.1:" dm
     }
@@ -535,26 +556,27 @@ YAML
   ratelimit_whitelist: []
   refuse_any: true
   upstream_dns:
-  - 127.0.0.1:${PW_DNS_PORT}
+  - ${AGH_UPSTREAM1}
+  - ${AGH_UPSTREAM2}
   - "[/lan/]127.0.0.1:${DNSMASQ_PORT}"
   - "[/local/]127.0.0.1:${DNSMASQ_PORT}"
-  - "[/home.arpa/]127.0.0.1:${DNSMASQ_PORT}"
   upstream_dns_file: ''
   bootstrap_dns:
   - ${BOOT1}
   - ${BOOT2}
+  - ${BOOT3}
   upstream_mode: parallel
   fastest_timeout: 1s
   cache_size: ${AGH_CACHE}
   cache_enabled: true
   cache_ttl_min: 0
   cache_ttl_max: 0
-  cache_optimistic: true
+  cache_optimistic: false
   cache_optimistic_answer_ttl: 30s
   cache_optimistic_max_age: 12h
   bogus_nxdomain: []
-  aaaa_disabled: false
-  enable_dnssec: false
+  aaaa_disabled: ${AGH_DISABLE_AAAA}
+  enable_dnssec: ${AGH_DNSSEC}
   edns_client_subnet:
     custom_ip: ''
     enabled: false
@@ -566,11 +588,7 @@ YAML
   bootstrap_prefer_ipv6: false
   upstream_timeout: 10s
   use_private_ptr_resolvers: true
-  private_networks:
-  - 192.168.0.0/16
-  - 10.0.0.0/8
-  - 172.16.0.0/12
-  - fd00::/8
+  private_networks: []
   local_ptr_upstreams:
   - 127.0.0.1:${DNSMASQ_PORT}
   use_dns64: false
@@ -753,7 +771,7 @@ step_preflight() {
 }
 
 step_packages() {
-    log "Step 1/7: packages"
+    log "Step 1/8: packages"
     pkg_installed adguardhome || pkg_install adguardhome || die "AdGuardHome install failed - see errors above"
     # In dry mode the install above only logs, so the binary cannot exist yet.
     [ "$DRY" = 1 ] || [ -x "$AGH_BIN" ] || die "$AGH_BIN missing after install - wrong package?"
@@ -773,7 +791,7 @@ step_packages() {
 }
 
 step_agh_config() {
-    log "Step 2/7: AdGuardHome config (:${AGH_PORT}, upstream PassWall2 :${PW_DNS_PORT})"
+    log "Step 2/8: AdGuardHome config (:${AGH_PORT}, upstream ${AGH_UPSTREAM1} + ${AGH_UPSTREAM2})"
     [ -n "${AGH_BIND_V4:-}" ] || AGH_BIND_V4="$(lan_ipv4)"
     [ "$DRY" = 1 ] || mkdir -p "$AGH_DIR" "$AGH_WORKDIR"
     backup "$AGH_YAML"
@@ -840,92 +858,130 @@ step_agh_config() {
 }
 
 step_dnsmasq() {
-    log "Step 3/7: dnsmasq -> port ${DNSMASQ_PORT}, drop legacy /tmp drop-in"
+    log "Step 3/8: dnsmasq -> port ${DNSMASQ_PORT}"
     backup "$DHCP_CFG"
 
     if [ "$(cget dhcp.@dnsmasq[0].port)" != "$DNSMASQ_PORT" ]; then
         cmd uci set "dhcp.@dnsmasq[0].port=$DNSMASQ_PORT"
     fi
     cmd uci set 'dhcp.@dnsmasq[0].authoritative=1'
-    # not a dnsmasq option, leftover from earlier versions of this script
+    # this key is invalid; remove it if an older version wrote it
     [ "$DRY" = 1 ] || uci -q delete 'dhcp.@dnsmasq[0].dns_redirect' 2>/dev/null || true
-
-    drop="$(cget dhcp.@dnsmasq[0].confdir)"
-    drop="${drop%%,*}"
-    [ -n "${drop:-}" ] || drop="/tmp/dnsmasq.d"
-    for f in "$drop/dnsmasq-passwall2.conf" /tmp/dnsmasq.d/dnsmasq-passwall2.conf; do
-        [ -f "$f" ] || continue
-        if grep -q 'Managed by agh-pw' "$f" 2>/dev/null; then
-            cmd rm -f "$f"
-            log "  - removed legacy drop-in $f"
-        fi
-    done
-
-    if [ "$DNSMASQ_FORWARD" = 1 ]; then
-        entry="127.0.0.1#${PW_DNS_PORT}"
-        if uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr ' ' '\n' | grep -qxF "$entry"; then
-            log "  - dnsmasq forward to $entry: already set"
-        else
-            cmd uci add_list "dhcp.@dnsmasq[0].server=$entry"
-        fi
-        cmd uci set 'dhcp.@dnsmasq[0].allservers=1'
-    fi
     cmd uci commit dhcp
 }
 
 step_passwall() {
-    log "Step 4/7: PassWall2 DNS settings"
+    log "Step 4/8: disable PassWall2 DNS redirect"
     if ! uci -q show passwall2 >/dev/null 2>&1; then
-        warn "passwall2 UCI config missing - skipping (install the core first)"
+        warn "passwall2 UCI config missing - skipping"
         return 0
     fi
     backup "$PW_CFG"
     cmd uci set 'passwall2.@global[0].dns_redirect=0'
     cmd uci set 'passwall2.@global[0].localhost_proxy=1'
-    if [ -z "$(cget passwall2.@global[0].remote_dns)" ]; then
-        cmd uci set "passwall2.@global[0].remote_dns=$BOOT1"
-        cmd uci set 'passwall2.@global[0].remote_dns_protocol=tcp'
-        cmd uci set 'passwall2.@global[0].remote_dns_detour=remote'
-    else
-        log "  - remote_dns already set ($(cget passwall2.@global[0].remote_dns)) - left alone"
-    fi
     cmd uci commit passwall2
 }
 
-step_firewall() {
-    log "Step 5/7: LAN-only firewall rule for :${AGH_PORT} and :3000"
-    if [ ! -f "$FW_CFG" ]; then
-        warn "$FW_CFG missing - skipping firewall rule (set one manually!)"
+# AdGuardHome UID and LAN interface are needed by the redirect chain: the UID
+# is the exception that keeps AdGuardHome's own bootstrap DNS out of the loop.
+resolve_hijack_settings() {
+    if [ -z "$AGH_UID" ]; then
+        ow="$(cget adguardhome.config.user)"
+        [ -n "${ow:-}" ] || ow=adguardhome
+        AGH_UID="$(id -u "$ow" 2>/dev/null || true)"
+    fi
+    if [ -z "$AGH_UID" ]; then
+        # Dry run before the package exists: nothing is written, so a
+        # placeholder is enough to show the plan.
+        [ "$DRY" = 1 ] || die "cannot determine AdGuardHome UID; set AGH_UID"
+        AGH_UID=853
+    fi
+    case "$AGH_UID" in *[!0-9]*) die "AGH_UID must be numeric: $AGH_UID" ;; esac
+    if [ -z "$LAN_IF" ]; then
+        LAN_IF="$(cget network.lan.device)"
+        [ -n "${LAN_IF:-}" ] || LAN_IF="$(cget network.lan.ifname)"
+        [ -n "${LAN_IF:-}" ] || LAN_IF="br-lan"
+    fi
+    case "$LAN_IF" in *[!A-Za-z0-9_.:-]*) die "invalid LAN_IF: $LAN_IF" ;; esac
+}
+
+step_dns_hijack() {
+    if [ "$DNS_HIJACK" != 1 ]; then
+        log "Step 5/8: nftables DNS redirect skipped (--no-dns-hijack)"
         return 0
     fi
-    sec="$(uci -q show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)\.name='Allow-AdGuardHome-LAN'$/\1/p" | head -n 1)"
-    if [ -n "${sec:-}" ]; then
-        log "  - rule Allow-AdGuardHome-LAN: present"
+    log "Step 5/8: nftables DNS redirect before PassWall2 NAT"
+    resolve_hijack_settings
+    if [ -e "$HIJACK_NFT" ] && ! grep -q 'Managed by openwrt-agh-passwall2' "$HIJACK_NFT" 2>/dev/null; then
+        die "$HIJACK_NFT exists and is not managed by this installer - refusing to overwrite"
+    fi
+    [ -f "$HIJACK_NFT" ] && HIJACK_EXISTED=1 || HIJACK_EXISTED=0
+    backup "$HIJACK_NFT"
+    if [ "$DRY" = 1 ]; then
+        log "  [dry] would write $HIJACK_NFT (LAN $LAN_IF, AdGuardHome uid $AGH_UID)"
+        return 0
+    fi
+    mkdir -p "$FW4_NFT_DIR" || die "cannot create $FW4_NFT_DIR"
+    cat > "$HIJACK_NFT" <<NFT || die "cannot write $HIJACK_NFT"
+# Managed by openwrt-agh-passwall2/install.sh - overwritten on every run.
+# Hook priority -150 runs before PassWall2 PSW2_NAT (dstnat - 1) and fw4
+# dstnat, so LAN clients using a hard-coded resolver are redirected here.
+# The output chain skips AdGuardHome's own uid: its bootstrap DNS must reach
+# the bootstrap resolvers directly, or AGH queries itself and returns SERVFAIL.
+chain agh_dns_hijack {
+	type nat hook prerouting priority -150; policy accept;
+
+	iifname "$LAN_IF" meta l4proto { tcp, udp } th dport 53 counter redirect to :$AGH_PORT comment "agh: LAN DNS to AdGuardHome"
+}
+
+chain agh_dns_hijack_out {
+	type nat hook output priority -150; policy accept;
+
+	meta skuid $AGH_UID counter return comment "agh: AdGuardHome own upstreams"
+	meta l4proto { tcp, udp } th dport 53 fib daddr type != local counter redirect to :$AGH_PORT comment "agh: router process DNS to AdGuardHome"
+}
+NFT
+    chmod 644 "$HIJACK_NFT"
+    [ "$HIJACK_EXISTED" = 0 ] && HIJACK_ADDED=1
+    log "  - wrote $HIJACK_NFT"
+}
+
+step_firewall() {
+    log "Step 6/8: block LAN access to dnsmasq :${DNSMASQ_PORT}"
+    if [ ! -f "$FW_CFG" ]; then
+        warn "$FW_CFG missing - LAN clients could query dnsmasq directly on :${DNSMASQ_PORT}"
+        return 0
+    fi
+    if uci -q show firewall 2>/dev/null | grep -q "Block-LAN-DNS-Bypass-${DNSMASQ_PORT}"; then
+        log "  - dnsmasq bypass block: present"
         return 0
     fi
     backup "$FW_CFG"
     if [ "$DRY" = 1 ]; then
-        log "  [dry] would add firewall rule Allow-AdGuardHome-LAN (lan -> :${AGH_PORT} :3000)"
+        log "  [dry] would add firewall rule Block-LAN-DNS-Bypass-${DNSMASQ_PORT}"
         return 0
     fi
     sec="$(uci add firewall rule)" || die "cannot add firewall rule"
-    uci set "firewall.${sec}.name=Allow-AdGuardHome-LAN"
+    uci set "firewall.${sec}.name=Block-LAN-DNS-Bypass-${DNSMASQ_PORT}"
     uci set "firewall.${sec}.src=lan"
-    uci set "firewall.${sec}.dest_port=${AGH_PORT} 3000"
     uci set "firewall.${sec}.proto=tcp udp"
-    uci set "firewall.${sec}.target=ACCEPT"
+    uci set "firewall.${sec}.dest_port=${DNSMASQ_PORT}"
+    uci set "firewall.${sec}.target=REJECT"
     uci commit firewall
     FW_ADDED="$sec"
-    log "  - rule Allow-AdGuardHome-LAN added"
+    log "  - rule Block-LAN-DNS-Bypass-${DNSMASQ_PORT} added"
 }
 
 step_restart() {
-    log "Step 6/7: restart dnsmasq -> passwall2 -> adguardhome"
+    log "Step 7/8: reload firewall, restart dnsmasq -> passwall2 -> adguardhome"
     initctl dnsmasq restart || { [ "$DRY" = 1 ] || die "dnsmasq restart failed"; }
     initctl passwall2 enable || true
     initctl passwall2 restart || warn "passwall2 restart failed"
     initctl adguardhome enable || true
     initctl adguardhome restart || { [ "$DRY" = 1 ] || die "adguardhome restart failed"; }
+    if [ "$DNS_HIJACK" = 1 ]; then
+        initctl firewall reload || warn "firewall reload failed - DNS redirect not active yet"
+    fi
 
     if [ "$DRY" = 1 ]; then
         log "  [dry] skip service verification"
@@ -957,13 +1013,13 @@ step_restart() {
         if nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1; then
             log "  - resolution through AdGuardHome: ok"
         else
-            warn "resolution through AdGuardHome failed (no PassWall2 node yet, or no upstream)"
+            warn "resolution through AdGuardHome failed (check DoH reachability and bootstrap DNS)"
         fi
     fi
 }
 
 step_watchdog() {
-    log "Step 7/7: AdGuardHome health watchdog (cron, every 2 min)"
+    log "Step 8/8: AdGuardHome health watchdog (cron, every 2 min)"
     if [ "$WATCHDOG" = 0 ]; then
         log "  - disabled (--no-watchdog)"
         return 0
@@ -1043,7 +1099,12 @@ step_summary() {
     log "==== Summary ===="
     printf '  dnsmasq port             : %s\n' "$(cget dhcp.@dnsmasq[0].port)"
     printf '  passwall2 dns_redirect   : %s\n' "$(cget passwall2.@global[0].dns_redirect)"
-    printf '  passwall2 localhost_proxy: %s\n' "$(cget passwall2.@global[0].localhost_proxy)"
+    printf '  AGH upstreams            : %s %s\n' "$AGH_UPSTREAM1" "$AGH_UPSTREAM2"
+    if [ "$DNS_HIJACK" = 1 ]; then
+        printf '  DNS redirect chain       : %s\n' "$HIJACK_NFT"
+    else
+        printf '  DNS redirect chain       : disabled\n'
+    fi
     if [ "$DRY" = 1 ]; then
         printf '  mode                     : dry-run (nothing changed)\n'
         return 0
@@ -1066,8 +1127,9 @@ step_summary() {
             log "     first-run admin credentials: $AGH_ADMIN_FILE"
         fi
     fi
-    log "  2) Add/choose nodes in LuCI -> Services -> PassWall2"
-    log "  3) Verify:  nslookup openwrt.org 127.0.0.1"
+    log "  2) Add/choose nodes in LuCI -> Services -> PassWall2 (not needed for AdGuardHome DoH)"
+    log "  3) Verify DNS with nslookup openwrt.lan 127.0.0.1 and nslookup example.com 127.0.0.1"
+    log "  4) nftables rules load on firewall reload; LAN DoH/DoT bypass is not blocked"
     if [ "$WATCHDOG" = 1 ] && [ -x "$WD_BIN" ]; then
         log "  watchdog: $WD_BIN (cron every 2 min, logread -t agh-pw-wd)"
     fi
@@ -1091,6 +1153,10 @@ rollback() {
             fi
         done < "$RUN_DIR/files"
     fi
+    if [ -n "${HIJACK_ADDED:-}" ]; then
+        rm -f "$HIJACK_NFT"
+        log "  removed $HIJACK_NFT"
+    fi
     if [ -n "${FW_ADDED:-}" ]; then
         uci -q delete "firewall.$FW_ADDED" 2>/dev/null || true
     fi
@@ -1100,18 +1166,19 @@ rollback() {
     uci -q commit firewall 2>/dev/null || true
     if [ "$AGH_PREV_RUNNING" = 0 ]; then
         if [ -f "$WD_BIN" ]; then
-        rm -f "$WD_BIN"
-        log "  removed $WD_BIN"
-    fi
-    if [ -f "$CRON_FILE" ] && grep -qs 'agh-pw-watchdog' "$CRON_FILE"; then
-        sed -i '/agh-pw-watchdog/d' "$CRON_FILE"
-        log "  removed watchdog cron entry"
-        "${INIT_D}/cron" restart >/dev/null 2>&1 || true
-    fi
-    "${INIT_D}/adguardhome" stop 2>/dev/null || true
+            rm -f "$WD_BIN"
+            log "  removed $WD_BIN"
+        fi
+        if [ -f "$CRON_FILE" ] && grep -qs 'agh-pw-watchdog' "$CRON_FILE"; then
+            sed -i '/agh-pw-watchdog/d' "$CRON_FILE"
+            log "  removed watchdog cron entry"
+            "${INIT_D}/cron" restart >/dev/null 2>&1 || true
+        fi
+        "${INIT_D}/adguardhome" stop 2>/dev/null || true
         "${INIT_D}/adguardhome" disable 2>/dev/null || true
     fi
     "${INIT_D}/dnsmasq" restart 2>/dev/null || true
+    [ "$DNS_HIJACK" = 1 ] && "${INIT_D}/firewall" reload >/dev/null 2>&1 || true
     warn "rollback done: dnsmasq should be back on :${AGH_PORT}. Check resolution: nslookup openwrt.org"
     ROLLBACK_ARMED=0
     return "$rc"
@@ -1146,20 +1213,18 @@ do_uninstall() {
         done
     fi
 
-    sec="$(uci -q show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)\.name='Allow-AdGuardHome-LAN'$/\1/p" | head -n 1)"
+    sec="$(uci -q show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)\.name='Block-LAN-DNS-Bypass-[0-9]*'$/\1/p" | head -n 1)"
     if [ -n "${sec:-}" ]; then
         uci delete "firewall.$sec"
         uci commit firewall
-        log "  removed firewall rule Allow-AdGuardHome-LAN"
+        log "  removed firewall rule Block-LAN-DNS-Bypass"
     fi
 
-    drop="$(cget dhcp.@dnsmasq[0].confdir)"
-    drop="${drop%%,*}"
-    [ -n "${drop:-}" ] || drop="/tmp/dnsmasq.d"
-    for f in "$drop/dnsmasq-passwall2.conf" /tmp/dnsmasq.d/dnsmasq-passwall2.conf; do
-        [ -f "$f" ] || continue
-        grep -q 'Managed by agh-pw' "$f" 2>/dev/null && rm -f "$f" && log "  removed $f"
-    done
+    if [ -f "$HIJACK_NFT" ] &&
+        grep -q 'Managed by openwrt-agh-passwall2' "$HIJACK_NFT" 2>/dev/null; then
+        rm -f "$HIJACK_NFT"
+        log "  removed $HIJACK_NFT"
+    fi
 
     if [ -f "$WD_BIN" ]; then
         rm -f "$WD_BIN"
@@ -1185,6 +1250,7 @@ do_uninstall() {
     if [ -x "${INIT_D}/passwall2" ]; then
         "${INIT_D}/passwall2" restart >/dev/null 2>&1 || warn "passwall2 restart failed"
     fi
+    [ -x "${INIT_D}/firewall" ] && "${INIT_D}/firewall" reload >/dev/null 2>&1 || true
     log "Done. AdGuardHome packages were NOT removed (opkg remove adguardhome)."
     log "Backups kept in $STATE_DIR (safe to delete after you are happy)."
 }
@@ -1194,7 +1260,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1 ;;
         --uninstall|--rollback) UNINSTALL=1 ;;
-        --dnsmasq-forward) DNSMASQ_FORWARD=1 ;;
+        --no-dns-hijack) DNS_HIJACK=0 ;;
         --no-watchdog) WATCHDOG=0 ;;
         -y|--yes) ASSUME=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -1220,6 +1286,7 @@ ROLLBACK_ARMED=1
 step_agh_config
 step_dnsmasq
 step_passwall
+step_dns_hijack
 step_firewall
 step_restart
 ROLLBACK_ARMED=0

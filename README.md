@@ -12,20 +12,32 @@ so they stop fighting over DNS and ports, with a tested rollback path.
 
 ```
 LAN client ──▶ router:53              AdGuardHome (filter, cache, query log)
-                   │
-                   ▼
-           127.0.0.1:15353            PassWall2 local DNS (CN-direct / foreign-proxy)
-                   │
-                   └─ .lan / .local / .home.arpa
-                        └─▶ 127.0.0.1:54   dnsmasq (DHCP + local names)
+router proc ──▶  (nftables redirect)        │
+                                            ├─▶ Quad9 DoH      (dns10.quad9.net)
+                                            ├─▶ Cloudflare DoH (cloudflare-dns.com)
+                                            └─ .lan / .local
+                                                 └─▶ 127.0.0.1:5335
+                                                      dnsmasq (DHCP + local names)
 ```
 
-dnsmasq hand-off note: OpenWrt keeps advertising the router address as the DNS
-server, so clients always talk to `:53`. AdGuardHome binds `:53` (LAN IPv4 +
-`127.0.0.1`, or `0.0.0.0` + `::` when IPv6 is enabled) and forwards everything
-except local names to PassWall2. With `IPV6_ENABLE=0` the web UI is pinned to
-`<lan-ip>:3000` for the same reason: AdGuardHome turns a plain `0.0.0.0` into a
-dual-stack `[::]` socket.
+AdGuardHome is the **only** resolver LAN clients and router processes use.
+External names go out over **encrypted DNS (DoH)**, independent of PassWall2's
+own DNS stack, so a PassWall2 node restart no longer kills resolution. Local
+names are answered by dnsmasq, which is moved out of the way to `:5335`.
+
+An nftables chain (`/etc/nftables.d/20-agh-dns-hijack.nft`) redirects every
+plaintext DNS query from the LAN — and from router processes — to AdGuardHome on
+`:53`. It is hooked at priority `-150`, i.e. **before** PassWall2's `PSW2_NAT`
+(`dstnat - 1`) and fw4's `dstnat`, so a client with a hard-coded resolver
+(`8.8.8.8`, ISP DNS) never bypasses filtering. AdGuardHome's own UID is exempted
+in the output chain: it has to reach the DoH bootstrap resolvers directly, or it
+would query itself and return `SERVFAIL`.
+
+Hand-off note: OpenWrt keeps advertising the router address as the DNS server, so
+clients always talk to `:53`. AdGuardHome binds `:53` (LAN IPv4 + `127.0.0.1`,
+or `0.0.0.0` + `::` when IPv6 is enabled). With `IPV6_ENABLE=0` the web UI is
+pinned to `<lan-ip>:3000` for the same reason: AdGuardHome turns a plain
+`0.0.0.0` into a dual-stack `[::]` socket.
 
 ---
 
@@ -37,9 +49,12 @@ dual-stack `[::]` socket.
 * The new AdGuardHome YAML is validated with `AdGuardHome --check-config`
   **before** dnsmasq gives up port 53.
 * If AdGuardHome does not answer on `:53` after the restart, the script rolls
-  back automatically: original configs restored, dnsmasq restarted on `:53`.
+  back automatically: original configs restored, the nft chain removed,
+  dnsmasq restarted on `:53`.
 * Re-running is idempotent: no duplicated YAML keys, no duplicate firewall
-  rules, no duplicate cron entries.
+  rules, no duplicate cron entries, no duplicated nft file.
+* An existing `20-agh-dns-hijack.nft` that was **not** written by this installer
+  is never overwritten — the run stops with an error instead.
 * `--dry-run` shows every action and changes nothing.
 * A 2-minute watchdog (cron) restarts AdGuardHome if it stops answering. It
   only restarts services — it never rewrites config, firewall, or ports.
@@ -48,7 +63,7 @@ dual-stack `[::]` socket.
 
 ## Requirements
 
-* OpenWrt 23.05 / 24.10 or newer (opkg **or** apk), root access
+* OpenWrt 23.05 / 24.10 or newer (opkg **or** apk), root access, `nft` (fw4)
 * `adguardhome` from the packages feed (the script installs it if missing)
 * PassWall2 core (`passwall2` / `luci-app-passwall2`) from a third-party feed —
   it is **not** in the official feeds. The script refuses to continue and prints
@@ -80,30 +95,38 @@ Options:
 | flag | effect |
 |---|---|
 | `--dry-run` | print planned actions, change nothing |
-| `--uninstall` | stop AdGuardHome, restore every backed-up file, remove the firewall rule and watchdog |
+| `--uninstall` | stop AdGuardHome, restore every backed-up file, remove the nft chain, the firewall rule and the watchdog |
 | `-y`, `--yes` | no confirmation prompt for `--uninstall` |
-| `--dnsmasq-forward` | additionally set `dhcp.@dnsmasq[0].server=127.0.0.1#15353` (persistent UCI, off by default; AdGuardHome already forwards) |
+| `--no-dns-hijack` | do not install/replace the nftables DNS redirect chain |
 | `--no-watchdog` | do not install the health cron |
 
 After it finishes:
 
 1. Open `http://<router-ip>:3000` and **create the admin login immediately**
    (until you do, anyone on the LAN can claim the UI).
-2. Add / choose proxy nodes in **LuCI → Services → PassWall2**.
-3. Verify: `nslookup openwrt.org 127.0.0.1`.
+2. Add / choose proxy nodes in **LuCI → Services → PassWall2**. Not required for
+   DNS: AdGuardHome resolves over its own DoH upstreams.
+3. Verify: `nslookup openwrt.org 127.0.0.1` and
+   `nslookup openwrt.lan 127.0.0.1`.
 
 ### Tunables (environment)
 
 | variable | default | meaning |
 |---|---|---|
 | `AGH_PORT` | `53` | AdGuardHome DNS port |
-| `DNSMASQ_PORT` | `54` | dnsmasq port |
-| `PW_DNS_PORT` | `15353` | PassWall2 local DNS port |
-| `AGH_CACHE` | `16777216` | DNS cache bytes (16 MiB). The old 64 MiB default is a common OOM cause on 128–256 MB routers |
+| `DNSMASQ_PORT` | `5335` | dnsmasq port (must differ from `AGH_PORT`) |
+| `AGH_UPSTREAM1` | `https://dns10.quad9.net/dns-query` | primary DoH upstream |
+| `AGH_UPSTREAM2` | `https://cloudflare-dns.com/dns-query` | second DoH upstream |
+| `BOOT1`, `BOOT2`, `BOOT3` | `9.9.9.10`, `149.112.112.10`, `1.1.1.1` | bootstrap resolvers for DoH hostname lookup only |
+| `AGH_CACHE` | `4194304` | DNS cache bytes (4 MiB) |
 | `AGH_RATELIMIT` | `0` | per-client qps limit, `0` = unlimited |
-| `AGH_FALLBACK` | *(empty)* | optional `fallback_dns`; empty means PassWall2 DNS is authoritative. Setting it makes AGH answer from plaintext DNS when PassWall2 DNS fails → **queries leak outside the tunnel** |
-| `IPV6_ENABLE` | `auto` | bind `::` when `/proc/net/inet6` exists |
-| `BOOT1`, `BOOT2` | `223.5.5.5`, `119.29.29.29` | bootstrap resolvers (plain IPv4, no IPv6) |
+| `AGH_DISABLE_AAAA` | `true` | drop AAAA answers |
+| `AGH_DNSSEC` | `true` | validate DNSSEC at AdGuardHome |
+| `AGH_FALLBACK` | *(empty)* | optional `fallback_dns`; empty means DoH only. Setting it makes AGH answer from plaintext DNS when both DoH upstreams fail → **queries leave the encrypted path** |
+| `IPV6_ENABLE` | `auto` | bind `::` when the IPv6 stack exists |
+| `DNS_HIJACK` | `1` | install the nftables redirect chain |
+| `HIJACK_NFT` | `/etc/nftables.d/20-agh-dns-hijack.nft` | path of the redirect chain file |
+| `AGH_UID`, `LAN_IF` | autodetected | AdGuardHome UID and LAN bridge used by the redirect chain |
 
 ---
 
@@ -116,30 +139,30 @@ After it finishes:
    `dns:` block; old list items (including the section-indented `- ::1` style
    AdGuardHome itself writes) are removed, so re-runs do not accumulate stale
    upstreams:
-   * `upstream_dns`: `127.0.0.1:15353` (**UDP**; `tcp://` breaks with
-     dns2socks-backed local DNS and churns conntrack entries), plus
-     `/lan/`, `/local/`, `/home.arpa/` → `127.0.0.1:54`
-   * `bootstrap_dns`: `223.5.5.5`, `119.29.29.29` (IPv4 only)
-   * `cache_size`: 16 MiB, `cache_optimistic: true`
+   * `upstream_dns`: Quad9 DoH, Cloudflare DoH, and `/lan/`, `/local/` →
+     `127.0.0.1:5335`
+   * `bootstrap_dns`: `9.9.9.10`, `149.112.112.10`, `1.1.1.1` (used only to
+     resolve the DoH hostnames)
+   * `cache_size`: 4 MiB, `cache_optimistic: false`
    * `ratelimit: 0` (a low limit makes bursts look like "DNS is down")
-   * private PTR: `use_private_ptr_resolvers: true` with RFC1918/ULA networks
-     pointed at dnsmasq, so reverse lookups stay local
-   * SafeSearch/parental OFF, DNSSEC off (it breaks through split DNS)
+   * `aaaa_disabled: true`, `enable_dnssec: true`
+   * private PTR: `use_private_ptr_resolvers: true`, `private_networks: []`,
+     `local_ptr_upstreams` → dnsmasq
+   * SafeSearch/parental OFF
    * if no config exists: writes a complete default, then patches it through
      the same path, so a fresh install and a later re-run are byte-identical
-3. **dnsmasq** — `port=54`, `authoritative=1`; deletes the bogus
-   `dns_redirect` option older versions of this script wrote; removes an old
-   `/tmp/dnsmasq.d/dnsmasq-passwall2.conf` **only if** it carries this
-   project's marker.
-4. **PassWall2** — `dns_redirect=0`, `localhost_proxy=1`. `remote_dns` /
-   protocol / detour are only set when empty — an existing DoH/DoT choice is
-   never overwritten.
-5. **Firewall** — one idempotent LAN-only rule (`Allow-AdGuardHome-LAN`,
-   tcp+udp 53 and 3000). Protect the admin UI on interfaces where `wan` input
-   is not dropped.
-6. **Services** — restart order dnsmasq → passwall2 → adguardhome, then verify
-   `:53`, `:54` and a real lookup; rollback if AdGuardHome is not listening.
-7. **Watchdog** — `/usr/sbin/agh-pw-watchdog` via `/etc/crontabs/root`, every
+3. **dnsmasq** — `port=5335`, `authoritative=1`; deletes the invalid
+   `dns_redirect` option older versions of this script wrote.
+4. **PassWall2** — `dns_redirect=0`, `localhost_proxy=1`. PassWall2's own DNS
+   stack is left untouched: AdGuardHome does not depend on it.
+5. **nftables redirect** — writes `20-agh-dns-hijack.nft` (prerouting + output
+   chains, priority `-150`) so LAN and router plaintext DNS land on `:53`.
+6. **Firewall** — one idempotent rule `Block-LAN-DNS-Bypass-5335` refuses
+   LAN → dnsmasq `:5335`, so clients cannot skip AdGuardHome's filtering.
+7. **Services** — restart order dnsmasq → passwall2 → adguardhome, then reload
+   the firewall (to load the nft chain) and verify `:53`, `:5335` and a real
+   lookup; rollback if AdGuardHome is not listening.
+8. **Watchdog** — `/usr/sbin/agh-pw-watchdog` via `/etc/crontabs/root`, every
    2 minutes, 5-minute cooldown, logs to `logread -t agh-pw-wd`.
 
 ---
@@ -147,11 +170,12 @@ After it finishes:
 ## Verify
 
 ```sh
-ss -lnup | grep -E ':53 |:54 |:15353 '   # listeners
-uci get dhcp.@dnsmasq[0].port           # 54
-uci get passwall2.@global[0].dns_redirect   # 0
-nslookup openwrt.org 127.0.0.1          # through AGH -> PassWall2
-nslookup openwrt.lan 127.0.0.1          # through AGH -> dnsmasq
+ss -lnup | grep -E ':53 |:5335 '              # listeners
+nft list chain inet fw4 agh_dns_hijack        # redirect rule
+uci get dhcp.@dnsmasq[0].port                 # 5335
+uci get passwall2.@global[0].dns_redirect     # 0
+nslookup openwrt.org 127.0.0.1                # through AGH -> DoH
+nslookup openwrt.lan 127.0.0.1                # through AGH -> dnsmasq
 logread -e AdGuardHome | tail
 ```
 
@@ -163,28 +187,35 @@ sh /tmp/diagnose.sh
 ```
 
 It prints memory/OOM evidence, listeners, conntrack usage, effective UCI values,
-the managed AGH keys, functional lookups, and a ranked verdict.
+the managed AGH keys, the nft chain state, functional lookups, and a ranked
+verdict.
 
 ---
 
-## "It works, then the internet dies while the node is still connected"
+## "It works, then DNS stops answering"
 
-This is almost never the proxy itself. In order of likelihood:
+In order of likelihood:
 
-1. **OOM kill.** AdGuardHome 64 MiB cache + querylog/statistics in `/var`
-   (tmpfs) + Xray/Sing-Box on a 128–256 MB router. Check `dmesg | grep -i oom`.
-   This installer uses a 16 MiB cache and `ratelimit: 0`; lower `AGH_CACHE`
-   further on small devices.
-2. **PassWall2 local DNS on `:15353` stopped.** dns2socks/chinadns-ng/Xray DNS
-   is restarted by PassWall2 on node switch and watchdog events and can stay
-   down. AdGuardHome has no second upstream by design (to avoid leaks), so DNS
-   dies while the node list still shows "connected". Check
-   `ss -lnu | grep 15353` and `logread | grep -i passwall`.
-3. **conntrack table full.** DNS-through-proxy with `tcp://` upstream churns
-   connections. Check `nf_conntrack_count` vs `nf_conntrack_max` in the report.
-4. **Config drift after a PassWall2 upgrade** re-enables DNS hijack, or
-   dnsmasq's port is reset to 53. The watchdog restarts services; re-run
-   `install.sh` to re-apply settings.
+1. **dnsmasq moved off `:5335`** (config drift, PassWall2 upgrade). Local names
+   and DHCP break, and AdGuardHome's `/lan/` upstream points at nothing. Re-run
+   `install.sh`; the report shows the effective port.
+2. **AdGuardHome stopped or lost `:53`** — OOM kill, config drift, or another
+   resolver grabbing the port. Check `dmesg | grep -i oom` and
+   `logread -e AdGuardHome`. The watchdog restarts the service every 2 minutes.
+3. **nft chains gone after a firewall reload** — LAN clients then bypass
+   AdGuardHome with their own resolver. `nft list chain inet fw4
+   agh_dns_hijack` shows whether they are loaded; re-run `install.sh` to rewrite
+   the file and reload the firewall.
+4. **Both DoH upstreams unreachable** — bootstrap DNS is only resolved through
+   `BOOT1..3`; if a proxy rule swallows port 53 for those addresses, DoH cannot
+   start. Check `logread -e AdGuardHome | grep -i upstream`.
+5. **OOM kill in general.** AdGuardHome cache + querylog/statistics in `/var`
+   (tmpfs) + Xray/Sing-Box on a 128–256 MB router. This installer uses a 4 MiB
+   cache and `ratelimit: 0`; lower `AGH_CACHE` further on small devices.
+
+Deliberately **not** installed: no DoT/DoH blocking of LAN clients and no
+`fallback_dns`. Clients that speak DoH to a third party are not stopped by this
+script; add a forwarding rule if you need that.
 
 ---
 
@@ -196,8 +227,9 @@ sh /tmp/agh-pw.sh --uninstall --yes  # unattended
 ```
 
 It restores the newest backup of every file the installer touched (from
-`/etc/agh-pw-backup/manifest.txt`), removes the firewall rule, the watchdog and
-its cron line, stops/disables AdGuardHome, and puts dnsmasq back on `:53`.
+`/etc/agh-pw-backup/manifest.txt`), removes the nft chain file (only if it
+carries this project's marker), the firewall rule, the watchdog and its cron
+line, stops/disables AdGuardHome, and puts dnsmasq back on `:53`.
 
 Manual equivalent:
 
@@ -214,15 +246,17 @@ Packages are **not** removed: `opkg remove adguardhome luci-app-adguardhome`.
 ## Known limitations
 
 * **IPv6:** AdGuardHome binds `::` (DNS and web UI) when the IPv6 stack is
-  present, otherwise
-  IPv6 clients (which get the router's link-local via RA) would have no
-  resolver. If you disable IPv6 later, re-run the installer so the config
-  matches, or AdGuardHome fails to bind.
-* **No upstream redundancy by default.** Everything goes to PassWall2 DNS.
-  `AGH_FALLBACK` trades leak-freedom for resilience; decide explicitly.
+  present, otherwise IPv6 clients (which get the router's link-local via RA)
+  would have no resolver. If you disable IPv6 later, re-run the installer so the
+  config matches, or AdGuardHome fails to bind.
+* **DoH only.** If both DoH endpoints are blocked on the ISP path, resolution
+  stops. `AGH_FALLBACK` trades encryption for resilience; decide explicitly.
 * **`/var/lib/adguardhome` is tmpfs** on OpenWrt: statistics and query log are
   lost on reboot and consume RAM. Persisting them means flash writes; the
   default keeps them ephemeral on purpose.
+* **`--no-dns-hijack`** leaves clients free to use their own resolver (and to
+  reach dnsmasq directly unless the firewall rule is present). Only useful if
+  you already redirect DNS some other way.
 * **Third-party feed required** for PassWall2; package names/feeds change
   between releases, so feed errors are surfaced instead of swallowed.
 * **Admin UI**: with IPv6 disabled AdGuardHome serves the UI on the LAN IPv4 only
@@ -237,10 +271,11 @@ Packages are **not** removed: `opkg remove adguardhome luci-app-adguardhome`.
 
 ## Tested
 
-* `shellcheck -s sh` clean; `busybox sh -n` clean
-* install / re-run / dry-run / rollback-on-bad-config / uninstall / watchdog
-  covered by the harness in `test/run_tests.sh` (fake uci/opkg/services, real
-  YAML + duplicate-key validation)
+* `sh -n` / `busybox sh -n` / `bash -n` clean
+* install / re-run / dry-run / rollback-on-bad-config / uninstall / watchdog /
+  `--no-dns-hijack` / unmanaged-nft-file refusal covered by the harness in
+  `test/run_tests.sh` (fake uci/opkg/services, real YAML + duplicate-key
+  validation)
 * Router targets: ipq807x (`qualcommax`), x86_64 in QEMU before touching
   production hardware. Always keep serial/TFTP recovery available.
 

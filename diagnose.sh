@@ -13,9 +13,10 @@
 set -u
 
 AGH_PORT="${AGH_PORT:-53}"
-DNSMASQ_PORT="${DNSMASQ_PORT:-54}"
-PW_DNS_PORT="${PW_DNS_PORT:-15353}"
+DNSMASQ_PORT="${DNSMASQ_PORT:-5335}"
 AGH_YAML="${AGH_YAML:-/etc/adguardhome/adguardhome.yaml}"
+HIJACK_NFT="${HIJACK_NFT:-/etc/nftables.d/20-agh-dns-hijack.nft}"
+AGH_UPSTREAM1="${AGH_UPSTREAM1:-https://dns10.quad9.net/dns-query}"
 OUT="${1:-}"
 FINDINGS=0
 
@@ -67,15 +68,14 @@ report() {
     fi
 
     head2 "listeners"
-    for p in "$AGH_PORT" "$DNSMASQ_PORT" "$PW_DNS_PORT"; do
+    for p in "$AGH_PORT" "$DNSMASQ_PORT"; do
         if listening "$p"; then
             ok "port $p: listening"
             sockets | grep -E "[:.]$p([[:space:]]|$)" | head -n 3 | sed 's/^/         /'
         else
             case "$p" in
                 "$AGH_PORT")    bad "port $AGH_PORT (AdGuardHome) not listening - clients have no DNS" ;;
-                "$DNSMASQ_PORT") bad "port $DNSMASQ_PORT (dnsmasq) not listening - .lan/.local lookups fail" ;;
-                *)              note "port $p (PassWall2 local DNS) not listening - normal if no node is running" ;;
+                *)              bad "port $p (dnsmasq) not listening - .lan/.local lookups fail" ;;
             esac
         fi
     done
@@ -93,14 +93,36 @@ report() {
     fi
 
     head2 "uci: dns wiring"
-    say "  dhcp dnsmasq port   : $(cfg dhcp.@dnsmasq[0].port)  (expect $DNSMASQ_PORT)"
-    say "  dhcp dnsmasq confdir: $(cfg dhcp.@dnsmasq[0].confdir)"
-    say "  dhcp dnsmasq server : $(cfg dhcp.@dnsmasq[0].server)"
+    say "  dhcp dnsmasq port       : $(cfg dhcp.@dnsmasq[0].port)  (expect $DNSMASQ_PORT)"
+    say "  dhcp dnsmasq localuse   : $(cfg dhcp.@dnsmasq[0].localuse)"
+    say "  dhcp dnsmasq server     : $(cfg dhcp.@dnsmasq[0].server)"
     say "  passwall2 dns_redirect  : $(cfg passwall2.@global[0].dns_redirect)  (expect 0)"
-    say "  passwall2 localhost_proxy: $(cfg passwall2.@global[0].localhost_proxy)  (expect 1)"
-    say "  passwall2 remote_dns    : $(cfg passwall2.@global[0].remote_dns) $(cfg passwall2.@global[0].remote_dns_protocol)"
+    say "  passwall2 localhost_proxy: $(cfg passwall2.@global[0].localhost_proxy)"
     [ "$(cfg dhcp.@dnsmasq[0].port)" = "$DNSMASQ_PORT" ] || bad "dnsmasq is not on $DNSMASQ_PORT - config drifted (re-run install.sh)"
-    [ "$(cfg passwall2.@global[0].dns_redirect)" = "0" ] || bad "PassWall2 DNS redirect is not 0 - it may hijack :$AGH_PORT"
+    [ "$(cfg passwall2.@global[0].dns_redirect)" = "0" ] || bad "PassWall2 DNS redirect is not 0 - it can hijack :$AGH_PORT"
+
+    head2 "nftables DNS redirect ($HIJACK_NFT)"
+    if [ -f "$HIJACK_NFT" ]; then
+        ok "redirect chain file present"
+        grep -E 'priority|dport 53|skuid' "$HIJACK_NFT" 2>/dev/null | sed 's/^/         /'
+    else
+        note "no redirect chain file - LAN clients may use their own resolver"
+    fi
+    if have nft; then
+        nft list chain inet fw4 agh_dns_hijack >/dev/null 2>&1 &&
+            ok "chain agh_dns_hijack is loaded in fw4" ||
+            bad "chain agh_dns_hijack not loaded - reload the firewall (re-run install.sh)"
+        nft list chain inet fw4 agh_dns_hijack_out >/dev/null 2>&1 &&
+            ok "chain agh_dns_hijack_out is loaded in fw4" ||
+            note "chain agh_dns_hijack_out not loaded - router DNS is not redirected"
+    else
+        note "nft not available - cannot verify loaded rules"
+    fi
+    if uci -q show firewall 2>/dev/null | grep -q "Block-LAN-DNS-Bypass"; then
+        ok "LAN -> dnsmasq bypass block present"
+    else
+        note "no dnsmasq bypass block - LAN clients can query :$DNSMASQ_PORT directly"
+    fi
 
     head2 "AdGuardHome config ($AGH_YAML)"
     if [ -f "$AGH_YAML" ]; then
@@ -109,15 +131,19 @@ report() {
             grep -E '  (port|bind_hosts|upstream_dns|upstream_mode|bootstrap_dns|fallback_dns|cache_size|ratelimit|use_private_ptr_resolvers|enable_dnssec):|  - ' |
             head -n 30 | sed 's/^/  /'
         grep -q '^  port: 53' "$AGH_YAML" 2>/dev/null || bad "AdGuardHome is not configured for port 53"
+        grep -q "https://dns10.quad9.net/dns-query" "$AGH_YAML" 2>/dev/null || bad "Quad9 DoH upstream missing"
+        grep -q "https://cloudflare-dns.com/dns-query" "$AGH_YAML" 2>/dev/null || note "Cloudflare DoH second upstream missing"
+        grep -q '\[/lan/\]127.0.0.1:'"$DNSMASQ_PORT" "$AGH_YAML" 2>/dev/null || bad "AdGuardHome /lan/ conditional upstream missing"
+        grep -q '127.0.0.1:15353' "$AGH_YAML" 2>/dev/null && bad "obsolete PassWall2 DNS upstream still configured"
         case "$(grep -m1 '^  cache_size:' "$AGH_YAML" 2>/dev/null)" in
-            *67108864*) bad "cache_size is 64 MiB - large for a router, can trigger OOM; use 16777216" ;;
+            *67108864*) bad "cache_size is 64 MiB - large for router RAM; use 4194304" ;;
         esac
         case "$(grep -m1 '^  ratelimit:' "$AGH_YAML" 2>/dev/null)" in
             *'ratelimit: 0') : ;;
             *'ratelimit:'*) note "ratelimit is enabled - bursts can look like DNS timeouts (0 disables it)" ;;
         esac
         grep -q '^  fallback_dns:' "$AGH_YAML" 2>/dev/null && \
-            note "fallback_dns set: when PassWall2 DNS fails, queries leak to plaintext fallback resolvers"
+            note "fallback_dns set: when both DoH upstreams fail, queries leak to plaintext resolvers"
     else
         bad "$AGH_YAML missing - AdGuardHome has no config"
     fi
@@ -136,36 +162,29 @@ report() {
     head2 "functional DNS checks"
     if have nslookup; then
         if nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1; then
-            ok "resolve via 127.0.0.1 (AdGuardHome -> PassWall2): ok"
+            ok "resolve via 127.0.0.1 (AdGuardHome -> DoH): ok"
         else
             bad "resolve via 127.0.0.1 failed"
         fi
         if have dig; then
-            if dig +time=3 +tries=1 @"127.0.0.1" -p "$PW_DNS_PORT" openwrt.org >/dev/null 2>&1; then
-                ok "resolve directly via PassWall2 :$PW_DNS_PORT: ok"
-            else
-                bad "resolve directly via PassWall2 :$PW_DNS_PORT failed - AGH upstream is dead"
-            fi
             if dig +time=3 +tries=1 @"127.0.0.1" -p "$DNSMASQ_PORT" openwrt.lan >/dev/null 2>&1; then
                 ok "dnsmasq :$DNSMASQ_PORT answers: ok"
             else
                 note "dnsmasq :$DNSMASQ_PORT did not answer a .lan query (may be normal if the name does not exist)"
             fi
+            if dig +time=3 +tries=1 @"127.0.0.1" openwrt.org >/dev/null 2>&1; then
+                ok "AdGuardHome :$AGH_PORT answers: ok"
+            else
+                bad "AdGuardHome :$AGH_PORT did not answer"
+            fi
         else
-            note "dig not installed - cannot test :$PW_DNS_PORT directly (opkg install bind-dig)"
+            note "dig not installed - cannot test :$DNSMASQ_PORT directly (opkg install bind-dig)"
         fi
     else
         note "nslookup not available"
     fi
 
     head2 "firewall / cron / logs"
-    if have uci; then
-        if uci -q show firewall 2>/dev/null | grep -q "Allow-AdGuardHome-LAN"; then
-            ok "LAN-only firewall rule present"
-        else
-            note "no Allow-AdGuardHome-LAN rule - :3000 may be reachable from WAN if the wan zone allows input"
-        fi
-    fi
     if [ -f /etc/crontabs/root ]; then
         if grep -qs agh-pw-watchdog /etc/crontabs/root; then ok "health watchdog cron installed"; else note "no watchdog cron - re-run install.sh"; fi
     fi
@@ -182,12 +201,11 @@ report() {
         say "  and compare: listeners, MemAvailable, conntrack, and logread OOM lines."
     else
         say "  $FINDINGS problem(s) marked [!!] above. Most common causes of"
-        say "  'works, then internet dies while the node stays connected':"
-        say "   1. OOM kill (64 MiB AGH cache / querylog in tmpfs / many goroutines)"
-        say "   2. PassWall2 local DNS :$PW_DNS_PORT stopped (node watchdog, dns2socks,"
-        say "      chinadns-ng crash) - AGH has no other upstream by design"
-        say "   3. conntrack table full (TCP DNS upstream through the proxy churns conns)"
-        say "   4. AGH bind/port drift after a PassWall2 upgrade re-enabled DNS hijack"
+        say "  'works, then DNS stops answering':"
+        say "   1. dnsmasq moved off :$DNSMASQ_PORT - .lan lookups and DHCP break"
+        say "   2. AdGuardHome stopped or lost :$AGH_PORT (OOM kill, config drift)"
+        say "   3. nft chains gone after a firewall reload - LAN bypasses AdGuardHome"
+        say "   4. Both DoH upstreams unreachable - bootstrap DNS blocked by a proxy rule"
     fi
 }
 
