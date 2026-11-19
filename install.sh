@@ -205,6 +205,9 @@ lan_ipv4() {
             ;;
     esac
     [ -n "${l:-}" ] || l="192.168.1.1"
+    # network.lan.ipaddr is a CIDR; AdGuardHome's netip.Addr fields reject the
+    # prefix and --check-config fails with ParseAddr(... "/24").
+    l="${l%%/*}"
     printf '%s' "$l"
 }
 gen_password() {
@@ -295,7 +298,16 @@ ensure_agh_admin() {
         return 0
     fi
 
-    body="{\"web\":{\"ip\":\"127.0.0.1\",\"port\":${web_port}},\"dns\":{\"ip\":\"${lanip}\",\"port\":${AGH_PORT}},\"username\":\"${user}\",\"password\":\"${pass}\"}"
+    # The install API binds the DNS address it is handed. dnsmasq still owns
+    # :53 at this point, so the real port makes it answer HTTP 400 and leaves
+    # users: [] (no admin). Probe on a scratch loopback port; only the users:
+    # block is transplanted into the real config afterwards.
+    probe_dns_port="${AGH_SETUP_DNS_PORT:-53535}"
+    while port_busy "$probe_dns_port"; do
+        probe_dns_port=$((probe_dns_port + 1))
+        [ "$probe_dns_port" -le 53545 ] || break
+    done
+    body="{\"web\":{\"ip\":\"127.0.0.1\",\"port\":${web_port}},\"dns\":{\"ip\":\"127.0.0.1\",\"port\":${probe_dns_port}},\"username\":\"${user}\",\"password\":\"${pass}\"}"
     api_out="$(agh_api_configure "$web_port" "$body")"
     api_rc=$?
     if [ "$api_rc" != 0 ]; then
